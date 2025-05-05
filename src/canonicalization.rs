@@ -1,3 +1,5 @@
+use mailparse::parse_headers;
+
 // Inspired from https://docs.rs/dkim/latest/src/dkim/canonicalization.rs.html
 use crate::bytes;
 
@@ -13,6 +15,97 @@ impl std::string::ToString for Type {
             Self::Relaxed => "relaxed".to_owned(),
         }
     }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum ContentTransferEncoding {
+    Base64,
+    QuotedPrintable,
+    SevenBit,
+    EightBit,
+    Binary,
+}
+
+fn normalize_body_content(body_content: Vec<u8>) -> Vec<u8> {
+    // Trim trailing whitespace
+    let trimmed_content = body_content
+        .iter()
+        .rev()
+        .skip_while(|&&b| b.is_ascii_whitespace())
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+
+    // Make sure there is only one space
+    let mut normalized_content = Vec::new();
+    let mut previous_was_whitespace = false;
+    for &byte in &trimmed_content {
+        if byte == b' ' || byte == b'\t' {
+            if !previous_was_whitespace {
+                normalized_content.push(b' ');
+                previous_was_whitespace = true;
+            }
+        } else {
+            normalized_content.push(byte);
+            previous_was_whitespace = false;
+        }
+    }
+
+    // Replace LF with CRLF and remove any CR before LF to avoid duplicating CR
+    let mut crlf_content = Vec::new();
+    let mut previous_byte = 32;
+    for &byte in &normalized_content {
+        if byte == b'\n' && previous_byte != b'\r' {
+            crlf_content.push(b'\r');
+        }
+        if byte != b'\r' || previous_byte != b'\r' {
+            crlf_content.push(byte);
+        }
+        previous_byte = byte;
+    }
+
+    // Ensure the content ends with CRLF
+    if crlf_content.len() < 2
+        || crlf_content[crlf_content.len() - 2] != b'\r'
+        || crlf_content[crlf_content.len() - 1] != b'\n'
+    {
+        crlf_content.extend_from_slice(b"\r\n");
+    }
+
+    // No spaces before \r\n anywhere in the content
+    let mut no_space_before_crlf_content = Vec::new();
+    let mut iter = crlf_content.iter().peekable();
+    while let Some(&byte) = iter.next() {
+        // Look ahead to check for space followed by \r\n
+        if byte == b' ' && iter.peek() == Some(&&b'\r') && iter.clone().nth(1) == Some(&b'\n') {
+            continue; // Skip adding the space to the output
+        }
+        no_space_before_crlf_content.push(byte);
+    }
+
+    no_space_before_crlf_content
+}
+
+pub(crate) fn get_canonicalized_body(email_bytes: &[u8]) -> Vec<u8> {
+    let (_, ix) = parse_headers(&email_bytes).unwrap();
+    let body = &email_bytes[ix..];
+
+    // Check if \n is used instead of \r\n for line endings if so replace it
+    let body = body
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &b)| {
+            if b == b'\n' && body.get(i.wrapping_sub(1)) != Some(&b'\r') {
+                vec![b'\r', b'\n'].into_iter()
+            } else {
+                vec![b].into_iter()
+            }
+        })
+        .collect::<Vec<u8>>();
+
+    normalize_body_content(body)
 }
 
 /// Canonicalize body using the simple canonicalization algorithm.

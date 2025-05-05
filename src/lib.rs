@@ -2,6 +2,7 @@
 
 use base64::engine::general_purpose;
 use base64::Engine;
+use chrono::DateTime;
 use hash::canonicalize_header_email;
 use indexmap::map::IndexMap;
 use rsa::traits::SignatureScheme;
@@ -36,7 +37,6 @@ mod roundtrip_test;
 mod sign;
 
 use crate::canonicalization::*;
-use crate::hash::get_body;
 pub use errors::DKIMError;
 use header::{DKIMHeader, HEADER, REQUIRED_TAGS};
 pub use parser::tag_list as parse_tag_list;
@@ -46,6 +46,20 @@ pub use sign::{DKIMSigner, SignerBuilder};
 
 const SIGN_EXPIRATION_DRIFT_MINS: i64 = 15;
 const DNS_NAMESPACE: &str = "_domainkey";
+
+#[cfg(target_arch = "wasm32")]
+fn get_current_time() -> chrono::NaiveDateTime {
+    use js_sys::Date;
+    let now = Date::new_0();
+    let timestamp = now.get_time() / 1000.0; // Convert milliseconds to seconds
+    chrono::NaiveDateTime::from_timestamp_opt(timestamp as i64, 0)
+        .expect("Invalid timestamp from browser")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_current_time() -> chrono::NaiveDateTime {
+    chrono::Utc::now().naive_utc()
+}
 
 #[derive(Debug)]
 pub enum DkimPublicKey {
@@ -123,14 +137,12 @@ fn validate_header(value: &str) -> Result<DKIMHeader, DKIMError> {
 
     // Check that "x=" tag isn't expired
     if let Some(expiration) = header.get_tag("x") {
-        let mut expiration = chrono::NaiveDateTime::from_timestamp_opt(
-            expiration.parse::<i64>().unwrap_or_default(),
-            0,
-        )
-        .ok_or(DKIMError::SignatureExpired)?;
+        let mut expiration =
+            DateTime::from_timestamp(expiration.parse::<i64>().unwrap_or_default(), 0)
+                .ok_or(DKIMError::SignatureExpired)?;
         expiration += chrono::Duration::minutes(SIGN_EXPIRATION_DRIFT_MINS);
-        let now = chrono::Utc::now().naive_utc();
-        if now > expiration {
+        let now = get_current_time();
+        if now > expiration.naive_utc() {
             return Err(DKIMError::SignatureExpired);
         }
     }
@@ -326,14 +338,9 @@ pub fn canonicalize_signed_email(
         .map_err(|err| {
             DKIMError::SignatureSyntaxError(format!("failed to decode signature: {}", err))
         })?;
-    let (header_canonicalization_type, body_canonicalization_type) =
+    let (header_canonicalization_type, _) =
         parser::parse_canonicalization(dkim_header.get_tag("c"))?;
-    let body = get_body(&email)?;
-    let canonicalized_body = if body_canonicalization_type == canonicalization::Type::Simple {
-        canonicalize_body_simple(&body)
-    } else {
-        canonicalize_body_relaxed(&body)
-    };
+    let canonicalized_body = get_canonicalized_body(email_bytes);
     let canonicalized_header = canonicalize_header_email(
         header_canonicalization_type,
         &dkim_header.get_required_tag("h"),
@@ -341,6 +348,7 @@ pub fn canonicalize_signed_email(
         &email,
     )?;
 
+    // Ok((canonicalized_header, Vec::new(), signature_raw))
     Ok((canonicalized_header, canonicalized_body, signature_raw))
 }
 
@@ -658,5 +666,85 @@ Joe.
         .await;
 
         assert!(dkim_verify_result.is_ok());
+    }
+}
+
+pub fn verify_email_with_key<'a>(
+    logger: &slog::Logger,
+    from_domain: &str,
+    email: &'a mailparse::ParsedMail<'a>,
+    public_key: DkimPublicKey,
+) -> Result<DKIMResult, DKIMError> {
+    let mut last_error = None;
+
+    for h in email.headers.get_all_headers(HEADER) {
+        let value = String::from_utf8_lossy(h.get_value_raw());
+        debug!(logger, "checking signature {:?}", value);
+
+        let dkim_header = match validate_header(&value) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!(logger, "failed to verify: {}", err);
+                last_error = Some(err);
+                continue;
+            }
+        };
+
+        // select the signature corresponding to the email sender
+        let signing_domain = dkim_header.get_required_tag("d");
+        if signing_domain.to_lowercase() != from_domain.to_lowercase() {
+            // CHECK!
+            continue;
+        }
+
+        let (header_canon_type, body_canon_type) =
+            parser::parse_canonicalization(dkim_header.get_tag("c"))?;
+        let hash_algo = parser::parse_hash_algo(&dkim_header.get_required_tag("a"))?;
+
+        let computed_body_hash = hash::compute_body_hash(
+            body_canon_type.clone(),
+            dkim_header.get_tag("l"),
+            hash_algo.clone(),
+            email,
+        )?;
+
+        let computed_header_hash = hash::compute_headers_hash(
+            logger,
+            header_canon_type.clone(),
+            &dkim_header.get_required_tag("h"),
+            hash_algo.clone(),
+            &dkim_header,
+            email,
+        )?;
+
+        debug!(logger, "body_hash {:?}", computed_body_hash);
+
+        let header_body_hash = dkim_header.get_required_tag("bh");
+
+        if header_body_hash != computed_body_hash {
+            return Err(DKIMError::BodyHashDidNotVerify);
+        }
+
+        let signature = general_purpose::STANDARD
+            .decode(dkim_header.get_required_tag("b"))
+            .map_err(|err| {
+                DKIMError::SignatureSyntaxError(format!("failed to decode signature: {}", err))
+            })?;
+
+        if !verify_signature(hash_algo, computed_header_hash, signature, public_key)? {
+            return Err(DKIMError::SignatureDidNotVerify);
+        }
+
+        return Ok(DKIMResult::pass(
+            signing_domain,
+            header_canon_type,
+            body_canon_type,
+        ));
+    }
+
+    if let Some(err) = last_error {
+        Ok(DKIMResult::fail(err, from_domain.to_owned()))
+    } else {
+        Ok(DKIMResult::neutral(from_domain.to_owned()))
     }
 }
